@@ -64,7 +64,7 @@ class MTF:
         self.mtfs = {k: v for k, v in sorted(self.mtfs.items(), key=lambda x: x[0])}
         for key, value in self.mtfs.items():
             self.norm_mtfs[key] = (
-                value / self.mtfs[lp_spacings[0]]
+                value / list(self.mtfs.values())[0]
             )  # normalize to first region
 
         # check that the MTF drops monotonically by measuring the deltas between MTFs
@@ -186,17 +186,20 @@ class PeakValleyMTF(MTF):
 
 
 def moments_mtf(mean: float, std: float) -> float:
-    """The moments-based MTF based on Hander et al 1997 Equation 8.
+    """The moments-based MTF based on Hander et al 1997 Equation 6.
+
+    Assumes spatial non-uniformity and random variation in counts is small compared to the spatial variation
+    introduced by the bar pattern.
 
     See Also
     --------
     https://aapm.onlinelibrary.wiley.com/doi/epdf/10.1118/1.597928
     """
-    return math.sqrt(2 * (std**2 - mean)) / mean
+    return 1.4142135623730951 * std / mean
 
 
 def moments_fwhm(width: float, mean: float, std: float) -> float:
-    """The moments-based FWHM based on Hander et al 1997 Equation A8.
+    """The moments-based FWHM based on Hander et al 1997 Equation A7.
 
     Parameters
     ----------
@@ -211,7 +214,17 @@ def moments_fwhm(width: float, mean: float, std: float) -> float:
     --------
     https://aapm.onlinelibrary.wiley.com/doi/epdf/10.1118/1.597928
     """
-    return 1.058 * width * math.sqrt(np.log(mean / (math.sqrt(2 * (std**2 - mean)))))
+    try:
+        return 1.058 * width * math.sqrt(np.log(mean / 1.4142135623730951 * std))
+    except ValueError:
+        # This equation fails when std is large compared to mean (square root of negative number)
+        warnings.warn(
+            message=f"Standard deviation ({std}) of the ROI is too large compared to the mean ({mean}) leading to "
+                    f"attempted square-root of a negative number.",
+            category=UserWarning
+        )
+        return None
+
 
 
 class MomentMTF:
