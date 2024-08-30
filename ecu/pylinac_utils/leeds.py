@@ -477,7 +477,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             )
             bg_rois.append(bg_roi)
 
-            lc_roi = pylinac.core.roi.LowContrastDiskROI(
+            lc_roi = pylinac.core.roi.LowContrastDiskROI.from_phantom_center(
                 array=self.image.array,
                 angle=self.phantom_angle + stng["angle"],
                 roi_radius=self.phantom_radius * stng["roi radius"],
@@ -682,7 +682,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
                 roi_indexes = stng["background"]
 
                 # create target ROI
-                roi = pylinac.core.roi.LowContrastDiskROI(
+                roi = pylinac.core.roi.LowContrastDiskROI.from_phantom_center(
                     self.image,
                     self.phantom_angle + stng["angle"],
                     self.phantom_radius * stng["roi radius"],
