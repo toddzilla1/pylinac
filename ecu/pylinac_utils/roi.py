@@ -6,6 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import scipy.interpolate
 
+import ecu.pylinac_utils.leeds
 import pylinac
 import numpy as np
 import pydantic
@@ -24,6 +25,40 @@ Self = typing.TypeVar('Self', bound='AnnulusROI')
 def clear_cached_property(instance, property_name):
     if property_name in instance.__dict__:
         del instance.__dict__[property_name]
+
+
+class LowContrastDiscROI(pylinac.core.roi.LowContrastDiskROI):
+    """Override to implement custom plotting."""
+
+    def add_to_interactive_plot(
+            self,
+            fig: go.Figure,
+            color: str = 'White',
+            show_legend: bool = True,
+            legend_group: str = 'lc_rois',
+            legend_group_title: str = 'Low Contrast',
+            legend_group_rank: int = None,
+            legend_text: str = 'ROI',
+    ):
+        xs, ys = [], []
+        num_vertices = 32
+        for i in range(num_vertices + 1):
+            angle = 2 * np.pi * i / num_vertices
+            xs.append(self.center.x + self.radius * math.cos(angle))
+            ys.append(self.center.y + self.radius * math.sin(angle))
+        fig.add_trace(go.Scatter(
+            x=xs,
+            y=ys,
+            fill='toself',
+            fillcolor=color,
+            mode='none',
+            showlegend=show_legend,
+            legendgroup=legend_group,
+            legendgrouptitle={'text': legend_group_title},
+            legendrank=legend_group_rank,
+            text=f'{self.contrast:.3f}',
+            name=legend_text,
+        ))
 
 
 class AnnulusROI(pydantic.BaseModel):
@@ -138,6 +173,69 @@ class AnnulusROI(pydantic.BaseModel):
                 color=edgecolor,
             )
 
+    def get_outline_coordinates_for_plot(self, num_vertices: int = 64) -> typing.Tuple[
+            typing.Tuple[typing.List, typing.List], typing.Tuple[typing.List, typing.List]]:
+        """
+        Provides coordinates for drawing the ROI outline on a plot. An annulus is typically drawn in plotly as two
+        separate traces, so the inner and outer coordinates are returned separately.
+
+        Returns:
+            (outer_xs, outer_ys), (inner_xs, inner_ys)
+        """
+
+        def calc_outline(radius: float) -> typing.Tuple[typing.List, typing.List]:
+            xs, ys = [], []
+            for i in range(num_vertices + 1):
+                angle = 2 * np.pi * i / num_vertices
+                xs.append(self.center_pt_px.x + radius * math.cos(angle))
+                ys.append(self.center_pt_px.y + radius * math.sin(angle))
+            return xs, ys
+
+        return calc_outline(self.roi_outer_radius_px), calc_outline(self.roi_inner_radius_px)
+
+    def add_to_interactive_plot(
+            self,
+            fig: go.Figure,
+            color: str = 'White',
+            show_legend: bool = True,
+            legend_group: str = 'lc_rois',
+            legend_group_title: str = 'Low Contrast',
+            legend_group_rank: int = None,
+            hover_text: str = None,
+            legend_text: str = None,
+    ):
+        """Add ROI to plotly figure"""
+        (outer_xs, outer_ys), (inner_xs, inner_ys) = self.get_outline_coordinates_for_plot()
+
+        # draw annulus 'hole' first
+        fig.add_trace(go.Scatter(
+            x=inner_xs,
+            y=inner_ys,
+            fill='none',
+            # fillcolor='rgba(0,0,0,0)',
+            mode='none',
+            showlegend=False,
+            legendgroup=legend_group,
+            legendgrouptitle={'text': legend_group_title},
+            legendrank=legend_group_rank,
+            text=hover_text,
+            name=legend_text,
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=outer_xs,
+            y=outer_ys,
+            fill='tonext',
+            fillcolor=color,
+            mode='none',
+            showlegend=show_legend,
+            legendgroup=legend_group,
+            legendgrouptitle={'text': legend_group_title},
+            legendrank=legend_group_rank,
+            text=hover_text,
+            name=legend_text,
+        ))
+
     def as_dict(self) -> dict:
         """Convert to dict. Useful for dataclasses/Result"""
         return {
@@ -220,11 +318,15 @@ class RectangularROI(pydantic.BaseModel):
         description='Pixel size in mm. Assumes square pixels.'
     )
 
-    # Constants for labeling Pandas columns
+    # Constants for labeling Pandas columns; used in both HighContrastRectangularROI and HighContrastRectangularROIStrip
+    # so placed here to be visible to both.
     COL_PIXEL_VALUE: typing.ClassVar[str] = 'Pixel Value'
     COL_DISTANCE_PX: typing.ClassVar[str] = 'Distance (Pixels)'
     COL_DISTANCE_MM: typing.ClassVar[str] = 'Distance (mm)'
     COL_DATA_TYPE: typing.ClassVar[str] = 'Data'
+    COL_HANNING: typing.ClassVar[str] = 'Hanning'
+    COL_FFT_MAGS: typing.ClassVar[str] = 'FFT Magnitude'
+    COL_FFT_FREQS: typing.ClassVar[str] = 'FFT Frequency (1/mm)'
 
     class Config:
         arbitrary_types_allowed = True
@@ -393,56 +495,67 @@ class RectangularROI(pydantic.BaseModel):
     def add_to_interactive_plot(
             self,
             fig: plotly.graph_objs.Figure,
-            line_color: str = 'White',
-            opacity: float = 1.0,
-            name: str = 'Rectangular ROI',
+            line_color: str = None,
+            fill_color: str = None,
+            hover_text: str = None,
+            legend_text: str = 'ROI',
             show_legend: bool = True,
+            legend_group: str = None,
             legend_group_title: str = None,
+            legend_group_rank: int = None,
             show_arrow: bool = True,
     ) -> None:
         """Add this ROI to the interactive plot."""
 
-        arrow_delta = self.width_px if self.width_px < self.height_px else self.height_px
-        arrow_delta *= 0.25
-        arrow_angle_rad = np.deg2rad(45.0)
-        # noinspection PyUnresolvedReferences
-        arrow_pt1 = pylinac.core.geometry.Point(
-            self.center_pt_px.x + arrow_delta * math.sin(self.rotation_rad_rel_image + arrow_angle_rad),
-            self.center_pt_px.y + arrow_delta * math.cos(self.rotation_rad_rel_image + arrow_angle_rad),
-        )
-        # noinspection PyUnresolvedReferences
-        arrow_pt2 = pylinac.core.geometry.Point(
-            self.center_pt_px.x + arrow_delta * math.sin(self.rotation_rad_rel_image - arrow_angle_rad),
-            self.center_pt_px.y + arrow_delta * math.cos(self.rotation_rad_rel_image - arrow_angle_rad),
-        )
-
-        svg_path = ''
-        svg_path += (f'M {self.pt_btm_left_px.x}, {self.pt_btm_left_px.y} ' +
-                     f'L {self.pt_top_left_px.x}, {self.pt_top_left_px.y} ' +
-                     f'L {self.pt_top_right_px.x}, {self.pt_top_right_px.y} ' +
-                     f'L {self.pt_btm_right_px.x}, {self.pt_btm_right_px.y} ')
+        # get coordinates for ROI outline
+        data = [
+            list(self.pt_btm_left_px.as_array()),
+            list(self.pt_top_left_px.as_array()),
+            list(self.pt_top_right_px.as_array()),
+            list(self.pt_btm_right_px.as_array()),
+            list(self.pt_btm_left_px.as_array()),
+        ]
 
         if show_arrow:
-            svg_path += (
-                    f'L {self.pt_btm_left_px.x}, {self.pt_btm_left_px.y} ' +
-                    f'M {self.pt_btm_middle_px.x}, {self.pt_btm_middle_px.y} ' +
-                    f'L {self.center_pt_px.x}, {self.center_pt_px.y} ' +
-                    f'L {arrow_pt1.x}, {arrow_pt1.y} ' +
-                    f'M {self.center_pt_px.x}, {self.center_pt_px.y} ' +
-                    f'L {arrow_pt2.x}, {arrow_pt2.y} ')
-        else:
-            svg_path += 'Z'
+            arrow_delta = self.width_px if self.width_px < self.height_px else self.height_px
+            arrow_delta *= 0.25
+            arrow_angle_rad = np.deg2rad(45.0)
+            # noinspection PyUnresolvedReferences
+            arrow_pt1 = pylinac.core.geometry.Point(
+                self.center_pt_px.x - arrow_delta * math.cos(self.rotation_rad_rel_image + arrow_angle_rad),
+                self.center_pt_px.y - arrow_delta * math.sin(self.rotation_rad_rel_image + arrow_angle_rad),
+            )
+            # noinspection PyUnresolvedReferences
+            arrow_pt2 = pylinac.core.geometry.Point(
+                self.center_pt_px.x - arrow_delta * math.cos(self.rotation_rad_rel_image - arrow_angle_rad),
+                self.center_pt_px.y - arrow_delta * math.sin(self.rotation_rad_rel_image - arrow_angle_rad),
+            )
 
-        fig.add_shape(
-            type='path',
-            path=svg_path,
-            line_color=line_color,
-            opacity=opacity,
+            data += [[math.nan, math.nan]]
+            data += [list(self.pt_btm_middle_px.as_array())]
+            data += [list(self.center_pt_px.as_array())]
+            data += [list(arrow_pt1.as_array())]
+            data += [list(arrow_pt2.as_array())]
+            data += [list(self.center_pt_px.as_array())]
+
+        # extract data
+        xs = [pt[0] for pt in data]
+        ys = [pt[1] for pt in data]
+
+        fig.add_trace(go.Scatter(
+            x=xs,
+            y=ys,
+            fill='none' if fill_color is None else 'toself',
+            fillcolor=fill_color,
+            mode='none' if line_color is None else 'lines',
+            line=dict(color=line_color),
             showlegend=show_legend,
-            name=name,
-            legendgroup=legend_group_title,
-            legendgrouptitle_text=legend_group_title,
-        )
+            legendgroup=legend_group,
+            legendgrouptitle=dict(text=legend_group_title),
+            legendrank=legend_group_rank,
+            text=f'mean = {self.mean:.3f}' if hover_text is None else hover_text,
+            name=legend_text,
+        ))
 
     def plot2axes(
             self,
@@ -498,24 +611,78 @@ class RectangularROI(pydantic.BaseModel):
 
 class HighContrastRectangularROI(RectangularROI):
     """Rectangular region of interest for a high contrast bar pattern in image."""
-    nominal_line_pairs_per_mm: float = pydantic.Field(frozen=True)
-    profile_resampled: pd.DataFrame = pydantic.Field(frozen=True)
-    profile_raw: pd.DataFrame = pydantic.Field(frozen=True)
+
+    nominal_line_pairs: float = pydantic.Field(
+        frozen=True,
+        description='The expected number of line pairs in this region.'
+    )
+
+    nominal_line_pairs_per_mm: float = pydantic.Field(
+        frozen=True,
+        description='The expected line pairs per mm for this high contrast bar pattern',
+    )
+
+    measured_line_pairs_per_mm: float = pydantic.Field(
+        default=None,
+        description='The measured line pairs per mm for this high contrast bar pattern',
+    )
+
+    nominal_max: float = pydantic.Field(
+        frozen=True,
+        description='The expected maximum pixel value for an ideal imaging system.',
+    )
+
+    nominal_min: float = pydantic.Field(
+        frozen=True,
+        description='The expected minimum pixel value for an ideal imaging system.',
+    )
+
+    profile_resampled: pd.DataFrame = pydantic.Field(
+        frozen=True,
+        description='The profile resampled at equal intervals to facilitate FFT calculation',
+    )
+
+    profile_raw: pd.DataFrame = pydantic.Field(
+        frozen=True,
+        description='Raw profile data as collected from the image.',
+    )
+
+    resampling_interval_mm: float = pydantic.Field(
+        frozen=True,
+        description='Distance between resampled profile data points, in mm',
+    )
+
+    fft_data: pd.DataFrame = pydantic.Field(
+        default=None,
+        description='FFT data calculated during calculation of the MTF'
+    )
+
+    fft_data_interpolated: pd.DataFrame = pydantic.Field(
+        default=None,
+        description='FFT data interpolated by cubic spline'
+    )
 
     @classmethod
     def from_strip_data(cls,
+                        nominal_line_pairs: float,
                         nominal_line_pairs_per_mm: float,
+                        nominal_max: float,
+                        nominal_min: float,
                         center_pt_px: pylinac.core.geometry.Point,
                         width_px: float,
                         height_px: float,
                         image_array: np.ndarray,
                         pixel_size_mm: float,
                         rotation_rad_rel_image: float,
-                        profile_resampled: pd.DataFrame,
                         profile_raw: pd.DataFrame,
+                        profile_resampled: pd.DataFrame,
+                        resampling_interval_mm: float,
                         ) -> 'HighContrastRectangularROI':
         return HighContrastRectangularROI(
+            nominal_line_pairs=nominal_line_pairs,
             nominal_line_pairs_per_mm=nominal_line_pairs_per_mm,
+            nominal_max=nominal_max,
+            nominal_min=nominal_min,
             center_pt_px=center_pt_px,
             width_px=width_px,
             height_px=height_px,
@@ -524,6 +691,7 @@ class HighContrastRectangularROI(RectangularROI):
             rotation_rad_rel_image=rotation_rad_rel_image,
             profile_resampled=profile_resampled,
             profile_raw=profile_raw,
+            resampling_interval_mm=resampling_interval_mm,
         )
 
     @classmethod
@@ -576,14 +744,165 @@ class HighContrastRectangularROI(RectangularROI):
         return index_lbl_beg, index_lbl_end
 
     @functools.cached_property
+    def _ideal_profile_dataframe(self) -> pd.DataFrame:
+        """Dataframe with points representing the ideal sin wave profile"""
+
+        # create new df with same x values as this ROI
+        df = self.profile_resampled[[self.COL_DISTANCE_MM]].copy()
+
+        # calculate ideal pixel values
+        amplitude = (self.nominal_max - self.nominal_min) / 2.0
+        wavelength_mm = 1.0 / self.nominal_line_pairs_per_mm
+        ys = [amplitude * (1 + math.sin(x * 2 * math.pi / wavelength_mm)) + self.nominal_min for x in
+              self.profile_resampled[self.COL_DISTANCE_MM].values]
+        df.loc[:, self.COL_PIXEL_VALUE] = ys
+
+        return df
+
+    @functools.cached_property
+    def _ideal_fft_max_magnitude(self) -> float:
+        """Calculates the maximum magnitude of an FFT for the ideal sin wave profile at the nominal frequency"""
+
+        # Get ideal profile
+        df = self._ideal_profile_dataframe
+
+        # Apply Hanning window to remove artifacts created from chopping the waveform at left and right edges
+        df.loc[:, self.COL_HANNING] = (df[self.COL_PIXEL_VALUE] * np.hanning(len(df[self.COL_PIXEL_VALUE])))
+
+        # Calculate FFT magnitudes
+        fft_magnitudes = np.abs(np.fft.fft(df[self.COL_HANNING]))
+
+        # Calculate FFT frequencies
+        num_samples = len(fft_magnitudes)
+        fft_frequencies = np.fft.fftfreq(n=num_samples, d=self.resampling_interval_mm)
+
+        # Create a dataframe with the FFT data. Only keep positive frequencies above approximately DC (0 lp/mm)
+        fft_data = pd.DataFrame({
+            self.COL_FFT_MAGS: fft_magnitudes[2:num_samples // 2],
+            self.COL_FFT_FREQS: fft_frequencies[2:num_samples // 2],
+        })
+
+        # Create a monotonic (doesn't 'overshoot') cubic spline to interpolate between discrete FFT results
+        # noinspection PyUnresolvedReferences
+        spline = scipy.interpolate.InterpolatedUnivariateSpline(
+            x=fft_data[self.COL_FFT_FREQS],
+            y=fft_data[self.COL_FFT_MAGS],
+            ext='zeros',
+        )
+
+        # Return FFT magnitude at ideal frequency
+        return spline(self.nominal_line_pairs_per_mm)
+
+    @functools.cached_property
     def mtf(self) -> float:
-        """Modulation Transfer Function for the ROI
+        """Modulation Transfer Function for the ROI"""
 
+        # Apply Hanning window to remove artifacts created from chopping the waveform at left and right edges
+        self.profile_resampled.loc[:, self.COL_HANNING] = (
+                self.profile_resampled[self.COL_PIXEL_VALUE] *
+                np.hanning(len(self.profile_resampled[self.COL_PIXEL_VALUE]))
+        )
 
-        """
+        # Calculate FFT magnitudes
+        fft_magnitudes = np.abs(np.fft.fft(self.profile_resampled[self.COL_HANNING]))
 
-        # TODO
-        return 1.0
+        # Calculate FFT frequencies
+        num_samples = len(fft_magnitudes)
+        fft_frequencies = np.fft.fftfreq(n=num_samples, d=self.resampling_interval_mm)
+
+        # Create a dataframe with the FFT data. Only keep positive frequencies above approximately DC (0 lp/mm)
+        self.fft_data = pd.DataFrame({
+            self.COL_FFT_MAGS: fft_magnitudes[2:num_samples//2],
+            self.COL_FFT_FREQS: fft_frequencies[2:num_samples//2],
+        })
+
+        # Create a monotonic (doesn't 'overshoot') cubic spline to interpolate between discrete FFT results
+        # noinspection PyUnresolvedReferences
+        spline = scipy.interpolate.InterpolatedUnivariateSpline(
+            x=self.fft_data[self.COL_FFT_FREQS],
+            y=self.fft_data[self.COL_FFT_MAGS],
+            ext='zeros',
+        )
+
+        # Save interpolated data in dataframe
+        start_per_mm = math.ceil(self.fft_data[self.COL_FFT_FREQS].min() * 100) / 100  # round to 0.01
+        end_per_mm = math.ceil(self.fft_data[self.COL_FFT_FREQS].max() * 100) / 100  # round to 0.01
+        xs = np.arange(start_per_mm, end_per_mm, 0.01)
+        ys = spline(xs)
+        self.fft_data_interpolated = pd.DataFrame({
+            self.COL_FFT_FREQS: xs,
+            self.COL_FFT_MAGS: ys,
+        })
+
+        # Note data type in dataframes
+        self.fft_data[self.COL_DATA_TYPE] = 'Discrete'
+        self.fft_data_interpolated[self.COL_DATA_TYPE] = 'Interpolated'
+
+        # Find maximum amplitude and associated frequency
+        max_magnitude_index = self.fft_data_interpolated[self.COL_FFT_MAGS].idxmax()
+        max_magnitude = self.fft_data_interpolated.loc[max_magnitude_index, self.COL_FFT_MAGS]
+        self.measured_line_pairs_per_mm = self.fft_data_interpolated.loc[max_magnitude_index, self.COL_FFT_FREQS]
+
+        # Approximate MTF as ratio of measured and ideal FFT magnitudes
+        return max_magnitude / self._ideal_fft_max_magnitude
+
+    def get_interactive_plot_profile(self) -> go.Figure:
+        """Plotly scatter plot with profile data"""
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatter(
+            x=self.profile_raw[self.COL_DISTANCE_MM],
+            y=self.profile_raw[self.COL_PIXEL_VALUE],
+            name='Original',
+            mode='markers',
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=self.profile_resampled[self.COL_DISTANCE_MM],
+            y=self.profile_resampled[self.COL_PIXEL_VALUE],
+            name='Resampled',
+            mode='markers',
+        ))
+
+        fig.update_layout(
+            title=f'Profile (nominal lp/mm = {self.nominal_line_pairs_per_mm:.2f})',
+            xaxis_title=self.COL_DISTANCE_MM,
+            yaxis_title=self.COL_PIXEL_VALUE,
+        )
+
+        return fig
+
+    def get_interactive_plot_fft(self) -> go.Figure:
+        """Plotly scatter plot with fft data"""
+
+        # make sure the MTF data is calculated
+        mtf = self.mtf
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatter(
+            x=self.fft_data[self.COL_FFT_FREQS],
+            y=self.fft_data[self.COL_FFT_MAGS],
+            name='Discrete',
+            mode='markers',
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=self.fft_data_interpolated[self.COL_FFT_FREQS],
+            y=self.fft_data_interpolated[self.COL_FFT_MAGS],
+            name='Interpolated',
+            mode='lines',
+        ))
+
+        fig.update_layout(
+            title=f'FFT (nominal lp/mm = {self.nominal_line_pairs_per_mm:.2f})',
+            xaxis=dict(range=ecu.pylinac_utils.leeds.LeedsTORUpdated.DEFAULT_LP_PER_MM_GRAPH_RANGE),
+            xaxis_title=self.COL_FFT_FREQS,
+            yaxis_title=self.COL_FFT_MAGS,
+        )
+
+        return fig
 
 
 class HighContrastRectangularROIStrip(RectangularROI):
@@ -764,8 +1083,10 @@ class HighContrastRectangularROIStrip(RectangularROI):
             df_sampled = df_sampled.loc[start_index_lbl:end_index_lbl]
 
             # snip ROI raw data as well
-            left_raw_index_lbl = (self.profile_raw[self.COL_DISTANCE_MM] - left_edge_mm).abs().idxmin()
-            right_raw_index_lbl = (self.profile_raw[self.COL_DISTANCE_MM] - right_edge_mm).abs().idxmin()
+            left_raw_index_lbl = (self.profile_raw[self.COL_DISTANCE_MM] - df_sampled.loc[start_index_lbl,
+                                  self.COL_DISTANCE_MM]).abs().idxmin()
+            right_raw_index_lbl = (self.profile_raw[self.COL_DISTANCE_MM] - df_sampled.loc[end_index_lbl,
+                                   self.COL_DISTANCE_MM]).abs().idxmin()
             df_raw = self.profile_raw.loc[left_raw_index_lbl:right_raw_index_lbl,
                      [self.COL_DISTANCE_MM, self.COL_PIXEL_VALUE, self.COL_DATA_TYPE]]
 
@@ -779,12 +1100,19 @@ class HighContrastRectangularROIStrip(RectangularROI):
             end_pt = self.pt_top_middle_px
             center_pt_px = ((end_pt - start_pt).as_point() * fractional_distance + start_pt).as_point()
 
+            # calculate resampling interval
+            resampling_interval_mm = (end_mm - start_mm) / len(df_sampled[self.COL_PIXEL_VALUE])
+
             self.regions.append(
                 HighContrastRectangularROI.from_strip_data(
                     profile_resampled=df_sampled,
+                    resampling_interval_mm=resampling_interval_mm,
                     profile_raw=df_raw,
                     image_array=self.image_array,
+                    nominal_line_pairs=self.all_nominal_line_pairs_per_region[region_index],
                     nominal_line_pairs_per_mm=self.all_nominal_line_pairs_per_mm[region_index],
+                    nominal_max=self.expected_max_pixel_value,
+                    nominal_min=self.expected_min_pixel_value,
                     pixel_size_mm=self.pixel_size_mm,
                     width_px=self.width_px,
                     height_px=(end_mm - start_mm) / self.pixel_size_mm,

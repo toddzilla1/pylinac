@@ -17,42 +17,6 @@ import pylinac.core.roi
 import ecu.pylinac_utils.roi
 
 
-class SampledProfileMTF(pylinac.core.mtf.MTF):
-    """Calculates the modulation transfer function (MTF) of a sampled profile."""
-
-    def __init__(self, rois: typing.List[ecu.pylinac_utils.roi.HighContrastRectangularROI]):
-        self.rois = rois
-
-        # Format some data as expected by the superclass
-        self.spacings = [roi.nominal_line_pairs_per_mm for roi in self.rois]
-        if len(self.spacings) < 2:
-            raise ValueError(
-                "The number of MTF spacings must be greater than 1."
-            )
-
-        self.mtfs = {}
-        for roi in self.rois:
-            self.mtfs[roi.nominal_line_pairs_per_mm] = roi.mtf
-
-        # sort according to spacings
-        self.mtfs = {k: v for k, v in sorted(self.mtfs.items(), key=lambda x: x[0])}
-
-        # normalize to first region
-        self.norm_mtfs = {}
-        for key, value in self.mtfs.items():
-            self.norm_mtfs[key] = (
-                    value / list(self.mtfs.values())[0]
-            )
-
-        # check that the MTF drops monotonically by measuring the deltas between MTFs
-        # if the delta is increasing it means the MTF rose on a subsequent value
-        max_delta = np.max(np.diff(list(self.norm_mtfs.values())))
-        if max_delta > 0:
-            warnings.warn(
-                "The MTF does not drop monotonically; be sure the ROIs are correctly aligned."
-            )
-
-
 class LeedsTORUpdated(pylinac.LeedsTOR):
     _roi_r1 = 0.775
     _roi_r2 = 0.03
@@ -89,7 +53,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
         "roi 17": {"distance from center": _roi_r1, "angle": 330, "roi radius": _roi_r2},
     }
 
-    # Overriding base method contrast methods
+    # Overriding base high contrast methods
     high_contrast_roi_settings = None
 
     high_contrast_roi_strips = [
@@ -131,6 +95,9 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
     high_contrast_roi_strips[2].all_nominal_line_pairs_per_region = [5, 5, 5, 5, 5, 5, 5]
     high_contrast_roi_strips[2].region_fractional_divisions = [-0.039873, 0.27358, 0.51645, 0.69112, 0.81195, 0.89989,
                                                                0.9618, 1.01]
+
+    # Default x-axis range for FFT graphs. Should cover expected range of high contrast nominal line pairs per mm.
+    DEFAULT_LP_PER_MM_GRAPH_RANGE: typing.ClassVar = [0, 6]
 
     high_contrast_max_roi = ecu.pylinac_utils.roi.RectangularROI.define_relative_to_phantom(
         location_radius_rel_phantom=0.255,
@@ -214,7 +181,8 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             for roi in strip.regions:
                 hc_rois.append(roi)
 
-            #todo process strip into ROIs
+        # sort hc ROIs by nominal lp/mm
+        hc_rois.sort(key=lambda sort_me: sort_me.nominal_line_pairs_per_mm)
 
         return hc_rois
 
@@ -236,6 +204,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             angle_adjustment: float = 0,
             roi_size_factor: float = 1,
             scaling_factor: float = 1,
+            suppress_phantom_angle_warning: bool = False,
     ) -> None:
         """Analyze the phantom using the provided thresholds and settings."""
 
@@ -250,7 +219,16 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             ssd=ssd,
             low_contrast_method=low_contrast_method,
             visibility_threshold=visibility_threshold,
+            x_adjustment=x_adjustment,
+            y_adjustment=y_adjustment,
+            angle_adjustment=angle_adjustment,
+            roi_size_factor=roi_size_factor,
+            scaling_factor=scaling_factor,
         )
+
+        # Check phantom angle
+        if not suppress_phantom_angle_warning:
+            self._check_phantom_angle()
 
         # Custom low contrast ROI processing
         self.low_contrast_background_rois, self.low_contrast_rois = self._sample_low_contrast_rois()
@@ -258,16 +236,29 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
         # Custom high contrast ROIs
         self.high_contrast_rectangular_rois = self._sample_high_contrast_rois()
 
-        # generate rMTF
-        self.mtf = SampledProfileMTF(
-            rois=self.high_contrast_rois
-        )
+    def _check_phantom_angle(self):
+        """Leeds recommends rotating the phantom to a non-cardinal angle to avoid the high contrast bar
+        patterns aligning with the pixel grid. Otherwise, MTF results are sensitive to the sampling phase
+        relationship between pattern and pixels and can vary from image to image. ISO 12233: "Digital cameras —
+        Resolution and spatial frequency responses" recommends 5 or 5.71 degrees rotation. Here we warn users if the
+        phantom angle aligns with a cardinal angle to within 3 degrees."""
 
-        # Override to use annulus ROIs
+        phantom_angle_deg = self.phantom_angle
+        remainder = math.fabs(phantom_angle_deg % 45)
+        if remainder <= 3.0 or remainder >= 42:
+            warnings.warn(
+                category=UserWarning,
+                message=f'Leeds recommends imaging your TOR phantom with a slight rotation for best results. If the '
+                        f'high contrast bar patterns align with the pixel grid, phase sampling issues arise during '
+                        f'MTF calculation and results can vary from image to image. In this image the phantom angle '
+                        f'is {phantom_angle_deg:.1f}°, which is within 3° of a cardinal angle or diagonal. Consider '
+                        f're-imaging at a different angle.',
+            )
 
-    # override low contrast calculation to use local background ROIs if specified
+    # Override to use annulus ROIs
+    # Override low contrast calculation to use local background ROIs if specified
     def _sample_low_contrast_rois(self) -> tuple[
-        list[ecu.pylinac_utils.roi.AnnulusROI], list[pylinac.core.roi.LowContrastDiskROI]]:
+        list[ecu.pylinac_utils.roi.AnnulusROI], list[ecu.pylinac_utils.roi.LowContrastDiscROI]]:
         """Sample the low-contrast sample regions for calculating contrast values."""
         bg_rois = []
         lc_rois = []
@@ -282,7 +273,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             )
             bg_rois.append(bg_roi)
 
-            lc_roi = pylinac.core.roi.LowContrastDiskROI.from_phantom_center(
+            lc_roi = ecu.pylinac_utils.roi.LowContrastDiscROI.from_phantom_center(
                 array=self.image.array,
                 angle=self.phantom_angle + stng["angle"],
                 roi_radius=self.phantom_radius * stng["roi radius"],
@@ -509,10 +500,70 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
 
         plt.show()
 
+    def plot_interactive_high_contrast_profiles(self) -> go.Figure:
+        """ Create interactive plot showing high contrast profile data. """
+
+        fig = go.Figure()
+
+        # Add traces, one for each profile. Use slider to select data
+        hc_roi: ecu.pylinac_utils.roi.HighContrastRectangularROI
+        for index, hc_roi in enumerate(self.high_contrast_rectangular_rois):
+            fig.add_trace(go.Scatter(
+                visible=False,
+                x=hc_roi.profile_raw[hc_roi.COL_DISTANCE_MM],
+                y=hc_roi.profile_raw[hc_roi.COL_PIXEL_VALUE],
+                mode='markers',
+                name=f'Region {index+1}',
+            ))
+
+        # Make first trace visible
+        # noinspection PyUnresolvedReferences
+        fig.data[0].visible = True
+
+        # Plot title
+        def title_str(j):
+            return (f'<b>High Contrast Profile Data</b><br>'
+                    f'<span style="font-size: 0.8em;">Region {j + 1}, Nominal lp/mm = '
+                    f'{self.high_contrast_rectangular_rois[j].nominal_line_pairs_per_mm:.2}, '
+                    f'MTF = {self.high_contrast_rectangular_rois[j].mtf:.3}</span>')
+
+        # Create slider step data
+        steps = []
+        for i in range(len(fig.data)):
+            is_visible_list = [False] * len(fig.data)
+            is_visible_list[i] = True
+            step = dict(
+                label=f'{i+1}',
+                method='update',
+                args=[
+                    dict(visible=is_visible_list),
+                    dict(title=title_str(i)),
+                ]
+            )
+            steps.append(step)
+
+        # Create slider data
+        sliders = [dict(
+            active=0,  # start with first step selected
+            currentvalue=dict(prefix='High Contrast Region '),
+            pad={"t": 50},
+            steps=steps
+        )]
+
+        fig.update_layout(
+            sliders=sliders,
+            title=title_str(0),
+            xaxis_title='Baseline Distance (mm)',
+            yaxis_title='Pixel Value',
+        )
+
+        return fig
+
     @pydantic.validate_arguments
-    def plot_interactive_rois(self, colors: list = px.colors.sequential.gray, color_cycles: pydantic.PositiveInt = 1,
-                              image_only: bool = False, show: bool = True) -> go.Figure:
-        """ Create interactive figure of the ROIs for Leeds TOR analysis. """
+    def plot_interactive_phantom_image(self, colors: list = px.colors.sequential.gray,
+                                       color_cycles: pydantic.PositiveInt = 1,
+                                       image_only: bool = False) -> go.Figure:
+        """ Create interactive figure of the Leeds TOR phantom and analysis. """
 
         #
         # Background image
@@ -576,6 +627,41 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
         #
 
         if not image_only:
+            # add background annuli
+            all_outer_xs, all_outer_ys, all_inner_xs, all_inner_ys = [], [], [], []
+            roi_bg: ecu.pylinac_utils.roi.AnnulusROI
+            for roi_bg in self.low_contrast_background_rois:
+                (outer_xs, outer_ys), (inner_xs, inner_ys) = roi_bg.get_outline_coordinates_for_plot()
+                all_outer_xs += outer_xs + [math.nan]
+                all_outer_ys += outer_ys + [math.nan]
+                all_inner_xs += inner_xs + [math.nan]
+                all_inner_ys += inner_ys + [math.nan]
+
+            # annuli 'holes'
+            fig.add_trace(go.Scatter(
+                x=all_inner_xs,
+                y=all_inner_ys,
+                fill='toself',
+                fillcolor='rgba(0,0,0,0.0)',
+                mode='none',
+                showlegend=False,
+                legendgroup='lc_rois',
+                legendrank=2,
+            ))
+
+            # annuli outer outline
+            fig.add_trace(go.Scatter(
+                x=all_outer_xs,
+                y=all_outer_ys,
+                fill='tonext',
+                fillcolor='rgba(0,0,255,0.2)',
+                mode='none',
+                showlegend=True,
+                legendgroup='lc_rois',
+                name='Background',
+                text='Low Contrast',
+            ))
+
             # find max contrast
             max_contrast = np.max([roi.contrast for roi in self.low_contrast_rois])
 
@@ -583,75 +669,78 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             norm = mpl.colors.TwoSlopeNorm(vmin=0, vmax=float(max_contrast), vcenter=float(self._low_contrast_threshold))
 
             # add to graph
-            num_vertices = 32
-            for roi in self.low_contrast_rois:
-                xs, ys = [], []
-                for i in range(num_vertices + 1):
-                    angle = 2 * np.pi * i / num_vertices
-                    xs.append(roi.center.x + roi.radius * math.cos(angle))
-                    ys.append(roi.center.y + roi.radius * math.sin(angle))
+            roi: ecu.pylinac_utils.roi.LowContrastDiscROI
+            for index, roi in enumerate(self.low_contrast_rois):
                 c = px.colors.sample_colorscale(px.colors.diverging.RdYlGn, norm(roi.contrast))[0]
-                fig.add_trace(go.Scatter(
-                    x=xs,
-                    y=ys,
-                    fill='toself',
-                    fillcolor=c,
-                    mode='none',
-                    showlegend=True, #if roi == self.low_contrast_rois[0] else False,
-                    legendgroup='lc_rois',
-                    legendgrouptitle={'text': 'Low Contrast'},
-                    text=f'{roi.contrast:.3f}',
-                    name=f'{roi.contrast:.3f}',
-                    legendrank=2,
-                ))
+                roi.add_to_interactive_plot(
+                    fig=fig,
+                    color=c,
+                    show_legend=True if index == 0 else False,
+                    legend_group_rank=2,
+                    legend_group='lc_rois',
+                    legend_group_title='Low Contrast',
+                    legend_text='ROIs',
+                )
 
+        #
         # Add high contrast ROIs
+        #
+
         if not image_only:
+            hc_rank = 3
             self.high_contrast_max_roi.add_to_interactive_plot(
                 fig=fig,
-                line_color='Yellow',
-                opacity=0.4,
-                name='Max',
-                show_legend=True,
-                legend_group_title='High Contrast',
+                line_color='rgb(255, 255, 0)',
+                fill_color='rgba(0, 0, 0, 0.0)', # fill with transparent color to trigger hover text inside outline
                 show_arrow=False,
+                show_legend=True,
+                legend_text='Max',
+                legend_group='hc_rois',
+                legend_group_title='High Contrast',
+                legend_group_rank=hc_rank,
             )
 
             self.high_contrast_min_roi.add_to_interactive_plot(
                 fig=fig,
-                line_color='Yellow',
-                opacity=0.4,
-                name='Min',
-                show_legend=True,
-                legend_group_title='High Contrast',
+                line_color='rgb(255, 255, 0)',
+                fill_color='rgba(0, 0, 0, 0.0)',  # fill with transparent color to trigger hover text inside outline
                 show_arrow=False,
+                show_legend=True,
+                legend_text='Min',
+                legend_group='hc_rois',
+                legend_group_title='High Contrast',
+                legend_group_rank=hc_rank,
             )
 
-            strip: ecu.pylinac_utils.roi.HighContrastRectangularROIStrip
-            for i, strip in enumerate(self.high_contrast_roi_strips, start=1):
-                strip.add_to_interactive_plot(
-                    fig=fig,
-                    line_color='Green',
-                    opacity=0.4,
-                    name=f'Strip {i}',
-                    show_legend=True,
-                    legend_group_title='High Contrast',
-                )
+            # strip: ecu.pylinac_utils.roi.HighContrastRectangularROIStrip
+            # for i, strip in enumerate(self.high_contrast_roi_strips, start=1):
+            #     strip.add_to_interactive_plot(
+            #         fig=fig,
+            #         line_color='rgba(0, 0, 255, 0.4)',
+            #         show_arrow=True,
+            #         show_legend=True,
+            #         legend_text=f'Strip {i}',
+            #         legend_group='hc_rois',
+            #         legend_group_title='High Contrast',
+            #         legend_group_rank=hc_rank,
+            #     )
 
-            roi: ecu.pylinac_utils.roi.HighContrastRectangularROI
-            for roi in self.high_contrast_rectangular_rois:
-                roi.add_to_interactive_plot(
+            rect_roi: ecu.pylinac_utils.roi.HighContrastRectangularROI
+            for index, rect_roi in enumerate(self.high_contrast_rectangular_rois):
+                rect_roi.add_to_interactive_plot(
                     fig=fig,
-                    line_color='Yellow',
-                    opacity=0.4,
-                    name=f'{roi.nominal_line_pairs_per_mm}',
-                    show_legend=True,
-                    legend_group_title='High Contrast',
+                    fill_color='rgba(255, 255, 0, 0.2)',
+                    hover_text=f'{rect_roi.nominal_line_pairs_per_mm} lp/mm',
                     show_arrow=False,
+                    show_legend=True if index == 0 else False,
+                    legend_text=f'ROIs',
+                    legend_group='hc_rois',
+                    legend_group_title='High Contrast',
+                    legend_group_rank=hc_rank,
                 )
 
         # update group click action
-        fig.update_layout(legend=dict(groupclick="toggleitem"))
+        fig.update_layout(legend=dict(groupclick="togglegroup"))
 
         # configure plot options
         config = {
@@ -663,9 +752,4 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             }
         }
 
-        # Display figure if requested
-        if show:
-            fig.show(config=config)
-
-        # fig.write_html('/Users/zilla/Downloads/leeds_analysis.html', config=config)
         return fig
