@@ -780,9 +780,12 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
 
             # Create function for finding x given y
             def find_x(target_y) -> float:
-                x_array = scipy.optimize.fsolve(spline_minus_target_y(target_y=target_y, spline=self.mtf_spline),
-                                                np.array([x_guess]))
-                return x_array[0]
+                x = scipy.optimize.brentq(  # find root using brentq method
+                    f=spline_minus_target_y(target_y=target_y, spline=self.mtf_spline),
+                    a=self.high_contrast_rectangular_rois[0].nominal_line_pairs_per_mm,  # range min
+                    b=self.high_contrast_rectangular_rois[-1].nominal_line_pairs_per_mm,  # range max
+                )
+                return x
 
             # Find the frequency for this mtf
             freq = find_x(mtf)
