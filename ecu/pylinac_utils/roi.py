@@ -174,7 +174,7 @@ class AnnulusROI(pydantic.BaseModel):
             )
 
     def get_outline_coordinates_for_plot(self, num_vertices: int = 64) -> typing.Tuple[
-            typing.Tuple[typing.List, typing.List], typing.Tuple[typing.List, typing.List]]:
+        typing.Tuple[typing.List, typing.List], typing.Tuple[typing.List, typing.List]]:
         """
         Provides coordinates for drawing the ROI outline on a plot. An annulus is typically drawn in plotly as two
         separate traces, so the inner and outer coordinates are returned separately.
@@ -497,6 +497,7 @@ class RectangularROI(pydantic.BaseModel):
             fig: plotly.graph_objs.Figure,
             line_color: str = None,
             fill_color: str = None,
+            opacity: float = 1.0,
             hover_text: str = None,
             legend_text: str = 'ROI',
             show_legend: bool = True,
@@ -547,6 +548,7 @@ class RectangularROI(pydantic.BaseModel):
             y=ys,
             fill='none' if fill_color is None else 'toself',
             fillcolor=fill_color,
+            opacity=opacity,
             mode='none' if line_color is None else 'lines',
             line=dict(color=line_color),
             showlegend=show_legend,
@@ -662,6 +664,9 @@ class HighContrastRectangularROI(RectangularROI):
         description='FFT data interpolated by cubic spline'
     )
 
+    # MTF = 0 if measured frequency varies by more than this amount from the nominal frequency
+    ALLOWED_FREQUENCY_DETECTION_ERROR: typing.ClassVar[float] = 0.10
+
     @classmethod
     def from_strip_data(cls,
                         nominal_line_pairs: float,
@@ -744,27 +749,67 @@ class HighContrastRectangularROI(RectangularROI):
         return index_lbl_beg, index_lbl_end
 
     @functools.cached_property
-    def _ideal_profile_dataframe(self) -> pd.DataFrame:
-        """Dataframe with points representing the ideal sin wave profile"""
+    def ideal_profile_square_wave(self) -> pd.DataFrame:
+        """Dataframe with points representing the ideal square wave profile"""
 
-        # create new df with same x values as this ROI
+        # Create new df with same x values as this ROI
         df = self.profile_resampled[[self.COL_DISTANCE_MM]].copy()
 
-        # calculate ideal pixel values
-        amplitude = (self.nominal_max - self.nominal_min) / 2.0
+        # Figure out wavelength
         wavelength_mm = 1.0 / self.nominal_line_pairs_per_mm
-        ys = [amplitude * (1 + math.sin(x * 2 * math.pi / wavelength_mm)) + self.nominal_min for x in
-              self.profile_resampled[self.COL_DISTANCE_MM].values]
-        df.loc[:, self.COL_PIXEL_VALUE] = ys
+
+        # Figure out phase shift by finding first mid-line crossing
+        top = self.profile_resampled[self.COL_PIXEL_VALUE].quantile(0.98)
+        bottom = self.profile_resampled[self.COL_PIXEL_VALUE].quantile(0.02)
+        middle = (top + bottom) / 2
+        start_index = (self.profile_resampled[self.COL_PIXEL_VALUE] > middle).idxmax()
+        phase_shift_mm = self.profile_resampled.loc[start_index, self.COL_DISTANCE_MM]
+
+        # Figure out amplitude
+        amplitude = (self.nominal_max - self.nominal_min) / 2.0
+
+        # Calculate ideal pixel values
+        df.loc[:, self.COL_PIXEL_VALUE] = ((1 + scipy.signal.square((df[self.COL_DISTANCE_MM] - phase_shift_mm) * 2 *
+                                                                    np.pi / wavelength_mm)) * amplitude +
+                                           self.nominal_min)
+        df.loc[:, self.COL_DATA_TYPE] = 'Ideal'
 
         return df
 
     @functools.cached_property
-    def _ideal_fft_max_magnitude(self) -> float:
+    def ideal_profile_sine_wave(self) -> pd.DataFrame:
+        """Dataframe with points representing the ideal sine wave profile"""
+
+        # Create new df with same x values as this ROI
+        df = self.profile_resampled[[self.COL_DISTANCE_MM]].copy()
+
+        # Figure out wavelength
+        wavelength_mm = 1.0 / self.nominal_line_pairs_per_mm
+
+        # Figure out phase shift by finding first mid-line crossing
+        top = self.profile_resampled[self.COL_PIXEL_VALUE].quantile(0.98)
+        bottom = self.profile_resampled[self.COL_PIXEL_VALUE].quantile(0.02)
+        middle = (top + bottom) / 2
+        start_index = (self.profile_resampled[self.COL_PIXEL_VALUE] > middle).idxmax()
+        phase_shift_mm = self.profile_resampled.loc[start_index, self.COL_DISTANCE_MM]
+
+        # Figure out amplitude
+        amplitude = (self.nominal_max - self.nominal_min) / 2.0
+
+        # Calculate ideal pixel values
+        ys = [amplitude * (1 + math.sin((x - phase_shift_mm) * 2 * math.pi / wavelength_mm)) + self.nominal_min for x in
+              self.profile_resampled[self.COL_DISTANCE_MM].values]
+        df.loc[:, self.COL_PIXEL_VALUE] = ys
+        df.loc[:, self.COL_DATA_TYPE] = 'Ideal'
+
+        return df
+
+    @functools.cached_property
+    def ideal_fft_max_magnitude(self) -> float:
         """Calculates the maximum magnitude of an FFT for the ideal sin wave profile at the nominal frequency"""
 
         # Get ideal profile
-        df = self._ideal_profile_dataframe
+        df = self.ideal_profile_sine_wave
 
         # Apply Hanning window to remove artifacts created from chopping the waveform at left and right edges
         df.loc[:, self.COL_HANNING] = (df[self.COL_PIXEL_VALUE] * np.hanning(len(df[self.COL_PIXEL_VALUE])))
@@ -812,8 +857,8 @@ class HighContrastRectangularROI(RectangularROI):
 
         # Create a dataframe with the FFT data. Only keep positive frequencies above approximately DC (0 lp/mm)
         self.fft_data = pd.DataFrame({
-            self.COL_FFT_MAGS: fft_magnitudes[2:num_samples//2],
-            self.COL_FFT_FREQS: fft_frequencies[2:num_samples//2],
+            self.COL_FFT_MAGS: fft_magnitudes[2:num_samples // 2],
+            self.COL_FFT_FREQS: fft_frequencies[2:num_samples // 2],
         })
 
         # Create a monotonic (doesn't 'overshoot') cubic spline to interpolate between discrete FFT results
@@ -843,8 +888,17 @@ class HighContrastRectangularROI(RectangularROI):
         max_magnitude = self.fft_data_interpolated.loc[max_magnitude_index, self.COL_FFT_MAGS]
         self.measured_line_pairs_per_mm = self.fft_data_interpolated.loc[max_magnitude_index, self.COL_FFT_FREQS]
 
-        # Approximate MTF as ratio of measured and ideal FFT magnitudes
-        return max_magnitude / self._ideal_fft_max_magnitude
+        if (abs(self.measured_line_pairs_per_mm / self.nominal_line_pairs_per_mm - 1.0) >
+                self.ALLOWED_FREQUENCY_DETECTION_ERROR):
+            # Too much variation between measured and expected frequencies. MTF = 0
+            return 0.0
+        else:
+            # Approximate MTF as ratio of measured and ideal FFT magnitudes
+            mtf = max_magnitude / self.ideal_fft_max_magnitude
+
+            # Sometimes mtf can be > 1 due to pixel sampling phase issues (or if the profile approaches a square wave
+            # instead of a sine wave. Set to one in these cases.
+            return mtf if mtf <= 1.0 else 1.0
 
     def get_interactive_plot_profile(self) -> go.Figure:
         """Plotly scatter plot with profile data"""
@@ -1084,9 +1138,9 @@ class HighContrastRectangularROIStrip(RectangularROI):
 
             # snip ROI raw data as well
             left_raw_index_lbl = (self.profile_raw[self.COL_DISTANCE_MM] - df_sampled.loc[start_index_lbl,
-                                  self.COL_DISTANCE_MM]).abs().idxmin()
+            self.COL_DISTANCE_MM]).abs().idxmin()
             right_raw_index_lbl = (self.profile_raw[self.COL_DISTANCE_MM] - df_sampled.loc[end_index_lbl,
-                                   self.COL_DISTANCE_MM]).abs().idxmin()
+            self.COL_DISTANCE_MM]).abs().idxmin()
             df_raw = self.profile_raw.loc[left_raw_index_lbl:right_raw_index_lbl,
                      [self.COL_DISTANCE_MM, self.COL_PIXEL_VALUE, self.COL_DATA_TYPE]]
 

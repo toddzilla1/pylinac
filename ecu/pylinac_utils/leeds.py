@@ -1,3 +1,4 @@
+import functools
 import math
 import random
 import typing
@@ -10,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import py_linq
 import pydantic
+import scipy.interpolate
 
 import pylinac
 import pylinac.core.roi
@@ -99,6 +101,9 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
     # Default x-axis range for FFT graphs. Should cover expected range of high contrast nominal line pairs per mm.
     DEFAULT_LP_PER_MM_GRAPH_RANGE: typing.ClassVar = [0, 6]
 
+    # Default MTF spline smoothing factor
+    DEFAULT_MTF_SPLINE_SMOOTHING_FACTOR = 1e-4
+
     high_contrast_max_roi = ecu.pylinac_utils.roi.RectangularROI.define_relative_to_phantom(
         location_radius_rel_phantom=0.255,
         location_angle_deg_rel_phantom=271,
@@ -165,7 +170,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
         )
 
         # OVERRIDDEN to use custom high contrast ROIs strips
-        hc_rois:typing.List[ecu.pylinac_utils.roi.HighContrastRectangularROI] = []
+        hc_rois: typing.List[ecu.pylinac_utils.roi.HighContrastRectangularROI] = []
         strip: ecu.pylinac_utils.roi.HighContrastRectangularROIStrip
         for strip in self.high_contrast_roi_strips:
             strip.expected_max_pixel_value = self.high_contrast_max_roi.mean
@@ -180,6 +185,9 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
 
             for roi in strip.regions:
                 hc_rois.append(roi)
+
+                # force MTF calculation
+                mtf = roi.mtf
 
         # sort hc ROIs by nominal lp/mm
         hc_rois.sort(key=lambda sort_me: sort_me.nominal_line_pairs_per_mm)
@@ -500,7 +508,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
 
         plt.show()
 
-    def plot_interactive_high_contrast_profiles(self) -> go.Figure:
+    def plot_interactive_high_contrast_profiles(self, ideal_is_square_wave: bool = True) -> go.Figure:
         """ Create interactive plot showing high contrast profile data. """
 
         fig = go.Figure()
@@ -508,32 +516,57 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
         # Add traces, one for each profile. Use slider to select data
         hc_roi: ecu.pylinac_utils.roi.HighContrastRectangularROI
         for index, hc_roi in enumerate(self.high_contrast_rectangular_rois):
+            # Measured profile
             fig.add_trace(go.Scatter(
                 visible=False,
                 x=hc_roi.profile_raw[hc_roi.COL_DISTANCE_MM],
                 y=hc_roi.profile_raw[hc_roi.COL_PIXEL_VALUE],
                 mode='markers',
-                name=f'Region {index+1}',
+                name=f'Measured',
             ))
 
-        # Make first trace visible
+            # Resampled profile
+            fig.add_trace(go.Scatter(
+                visible=False,
+                x=hc_roi.profile_resampled[hc_roi.COL_DISTANCE_MM],
+                y=hc_roi.profile_resampled[hc_roi.COL_PIXEL_VALUE],
+                mode='markers',
+                name=f'Resampled',
+            ))
+
+            # Ideal profile
+            ideal_profile = hc_roi.ideal_profile_square_wave if ideal_is_square_wave else hc_roi.ideal_profile_sine_wave
+            fig.add_trace(go.Scatter(
+                visible=False,
+                x=ideal_profile[hc_roi.COL_DISTANCE_MM],
+                y=ideal_profile[hc_roi.COL_PIXEL_VALUE],
+                mode='lines',
+                name=f'Ideal',
+            ))
+
+        # Make first traces (measured, resampled, and ideal) visible
         # noinspection PyUnresolvedReferences
         fig.data[0].visible = True
+        # noinspection PyUnresolvedReferences
+        fig.data[1].visible = True
+        # noinspection PyUnresolvedReferences
+        fig.data[2].visible = True
 
         # Plot title
         def title_str(j):
             return (f'<b>High Contrast Profile Data</b><br>'
-                    f'<span style="font-size: 0.8em;">Region {j + 1}, Nominal lp/mm = '
-                    f'{self.high_contrast_rectangular_rois[j].nominal_line_pairs_per_mm:.2}, '
-                    f'MTF = {self.high_contrast_rectangular_rois[j].mtf:.3}</span>')
+                    f'<span style="font-size: 0.8em;">nominal 𝛎 = '
+                    f'{self.high_contrast_rectangular_rois[j].nominal_line_pairs_per_mm:.2} lp/mm, '
+                    f'measured 𝛎 = {self.high_contrast_rectangular_rois[j].measured_line_pairs_per_mm:.2} lp/mm, '
+                    f'mtf = {self.high_contrast_rectangular_rois[j].mtf:.3}</span>')
 
         # Create slider step data
         steps = []
-        for i in range(len(fig.data)):
+        for i in range(len(fig.data) // 3):
             is_visible_list = [False] * len(fig.data)
-            is_visible_list[i] = True
+            is_visible_list[3 * i:3 * i + 3] = (True, True, True)
             step = dict(
-                label=f'{i+1}',
+                label=f'{i + 1}',
                 method='update',
                 args=[
                     dict(visible=is_visible_list),
@@ -555,6 +588,335 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             title=title_str(0),
             xaxis_title='Baseline Distance (mm)',
             yaxis_title='Pixel Value',
+            showlegend=True,
+        )
+
+        return fig
+
+    def plot_interactive_high_contrast_fft_data(self) -> go.Figure:
+        """ Create interactive plot showing high contrast fft data. """
+
+        fig = go.Figure()
+
+        # Add traces, one for each profile. Use slider to select data
+        hc_roi: ecu.pylinac_utils.roi.HighContrastRectangularROI
+        for index, hc_roi in enumerate(self.high_contrast_rectangular_rois):
+            # Measured fft
+            fig.add_trace(go.Scatter(
+                visible=False,
+                x=hc_roi.fft_data[hc_roi.COL_FFT_FREQS],
+                y=hc_roi.fft_data[hc_roi.COL_FFT_MAGS],
+                mode='markers',
+                name=f'Discrete FFT',
+            ))
+
+            # Interpolated fft
+            fig.add_trace(go.Scatter(
+                visible=False,
+                x=hc_roi.fft_data_interpolated[hc_roi.COL_FFT_FREQS],
+                y=hc_roi.fft_data_interpolated[hc_roi.COL_FFT_MAGS],
+                mode='lines',
+                name=f'Spline Fit',
+            ))
+
+        # Make first traces (measured and spline) visible
+        # noinspection PyUnresolvedReferences
+        fig.data[0].visible = True
+        # noinspection PyUnresolvedReferences
+        fig.data[1].visible = True
+
+        # Add a vertical line at the nominal frequency
+        x0 = self.high_contrast_rectangular_rois[0].nominal_line_pairs_per_mm
+        fig.add_vline(
+            x=x0,
+            line_dash='dot',
+            annotation_text=f' nominal 𝛎 = {x0:.2f}',
+            annotation_position='bottom left',
+            annotation_textangle=-90,
+        )
+
+        # Add a horizontal line at the ideal magnitude
+        y0 = self.high_contrast_rectangular_rois[0].ideal_fft_max_magnitude
+        fig.add_hline(
+            y=y0,
+            line_dash='dot',
+            annotation_text=f'ideal signal max = {y0:.2f}',
+            annotation_position='top right',
+        )
+
+        # Plot title
+        def title_str(j):
+            return (f'<b>High Contrast FFT Data</b><br>'
+                    f'<span style="font-size: 0.8em;">'
+                    f'measured 𝛎 = {self.high_contrast_rectangular_rois[j].measured_line_pairs_per_mm:.3} lp/mm, '
+                    f'mtf = {self.high_contrast_rectangular_rois[j].mtf:.3}</span>')
+
+        # Create slider step data
+        steps = []
+        for i in range(len(fig.data) // 2):
+            is_visible_list = [False] * len(fig.data)
+            is_visible_list[2 * i:2 * i + 2] = (True, True)
+            x = self.high_contrast_rectangular_rois[i].nominal_line_pairs_per_mm
+            y = self.high_contrast_rectangular_rois[i].ideal_fft_max_magnitude
+            step = dict(
+                label=f'{i + 1}',
+                method='update',
+                args=[
+                    # Trace data
+                    dict(visible=is_visible_list),
+
+                    # Layout data
+                    dict(title=title_str(i),
+                         shapes=[
+                             # vertical line
+                             dict(
+                                 type="line",
+                                 x0=x,
+                                 x1=x,
+                                 y0=0,
+                                 y1=1,
+                                 xref="x",
+                                 yref="paper",
+                                 line=dict(dash="dot"),
+                             ),
+
+                             # horizontal line
+                             dict(
+                                 type="line",
+                                 x0=0,
+                                 x1=1,
+                                 y0=y,
+                                 y1=y,
+                                 xref="paper",
+                                 yref="y",
+                                 line=dict(dash="dot"),
+                             )
+                         ],
+                         annotations=[
+                             # vertical line
+                             dict(
+                                 x=x,
+                                 y=0,
+                                 xref='x',
+                                 yref='paper',
+                                 text=f' nominal 𝛎 = {x:.2f}',
+                                 textangle=-90,
+                                 showarrow=False,
+                                 xanchor='right',
+                                 yanchor='bottom',
+                             ),
+
+                             # horizontal line
+                             dict(
+                                 x=1,
+                                 y=y,
+                                 xref='paper',
+                                 yref='y',
+                                 text=f'ideal signal max = {y:.2f}',
+                                 showarrow=False,
+                                 xanchor='right',
+                                 yanchor='bottom',
+                             )
+                         ],
+                         ),
+                ]
+            )
+            steps.append(step)
+
+        # Create slider data
+        sliders = [dict(
+            active=0,  # start with first step selected
+            currentvalue=dict(prefix='High Contrast Region '),
+            pad={"t": 50},
+            steps=steps
+        )]
+
+        fig.update_layout(
+            sliders=sliders,
+            title=title_str(0),
+            xaxis_title='Frequency, 𝛎 (lp/mm)',
+            yaxis_title='FFT Magnitude',
+            showlegend=True,
+        )
+
+        fig.update_layout(xaxis=dict(range=self.DEFAULT_LP_PER_MM_GRAPH_RANGE))
+
+        return fig
+
+    # noinspection PyUnresolvedReferences
+
+    @functools.cached_property
+    def mtf_spline(self) -> scipy.interpolate.BSpline:
+        """ Returns a spline fit to the measured MTF data """
+
+        # Subclass to ensure values never go below zero
+        class NonNegativeUnivariateSpline(scipy.interpolate.UnivariateSpline):
+            def __call__(self, x):
+                # Call the original spline function
+                y = super().__call__(x)
+
+                # Return the modified values (no less than 0)
+                return np.maximum(y, 0)
+
+        roi: ecu.pylinac_utils.roi.HighContrastRectangularROI
+        spline = NonNegativeUnivariateSpline(
+            x=[roi.nominal_line_pairs_per_mm for roi in self.high_contrast_rectangular_rois],
+            y=[roi.mtf for roi in self.high_contrast_rectangular_rois],
+            s=self.DEFAULT_MTF_SPLINE_SMOOTHING_FACTOR,
+        )
+
+        return spline
+
+    @pydantic.validate_arguments
+    def calc_lp_per_mm_at_given_mtf(self, mtf: pydantic.confloat(gt=0.0, lt=1.0)) -> float:
+        freq = None
+        try:
+            # Helper function for spline(x) - y = 0
+            def spline_minus_target_y(target_y, spline):
+                return lambda x: spline(x) - target_y
+
+            # Use second pt.x as starting guess for root finding
+            x_guess = self.high_contrast_rectangular_rois[1].nominal_line_pairs_per_mm
+
+            # Create function for finding x given y
+            def find_x(target_y) -> float:
+                x_array = scipy.optimize.fsolve(spline_minus_target_y(target_y=target_y, spline=self.mtf_spline),
+                                                np.array([x_guess]))
+                return x_array[0]
+
+            # Find the frequency for this mtf
+            freq = find_x(mtf)
+        except IndexError as e:
+            warnings.warn(f'IndexError while trying to find frequency for given MTF. {e=}')
+        finally:
+            return freq
+
+    @pydantic.validate_arguments
+    def plot_interactive_mtf(self, spline_smoothing_factor: pydantic.NonNegativeFloat = 1e-4) -> go.Figure:
+        """ Create interactive plot showing high contrast MTF data. """
+        fig = go.Figure()
+
+        # Add measured MTF data
+        roi: ecu.pylinac_utils.roi.HighContrastRectangularROI
+        fig.add_trace(go.Scatter(
+            x=[roi.nominal_line_pairs_per_mm for roi in self.high_contrast_rectangular_rois],
+            y=[roi.mtf for roi in self.high_contrast_rectangular_rois],
+            mode='markers',
+            name=f'Measured MTF',
+        ))
+
+        # Add interpolated data
+        xs = np.linspace(
+            start=self.high_contrast_rectangular_rois[0].nominal_line_pairs_per_mm,
+            stop=self.high_contrast_rectangular_rois[-1].nominal_line_pairs_per_mm,
+            num=1000,
+        )
+        fig.add_trace(go.Scatter(
+            x=xs,
+            y=self.mtf_spline(xs),
+            mode='lines',
+            name='Spline Approx.',
+        ))
+
+        # Add lines at MTF = 0.5
+        y0 = 0.5
+        fig.add_hline(
+            y=y0,
+            line_dash='dot',
+            annotation_text=f'mtf = {y0:.2f}',
+            annotation_position='top right',
+        )
+        x0 = self.calc_lp_per_mm_at_given_mtf(mtf=y0)
+        fig.add_vline(
+            x=x0,
+            line_dash='dot',
+            annotation_text=f'𝛎 = {x0:.2f}',
+            annotation_position='bottom left',
+            annotation_textangle=-90,
+        )
+
+        # Create slider step data for mtf = 0.1, 0.2 ... 0.8, 0.9
+        steps = []
+        for y in [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]:
+            x = self.calc_lp_per_mm_at_given_mtf(mtf=y)
+            step = dict(
+                label=f'{y}',
+                method='update',
+                args=[
+                    # Trace data
+                    dict(),
+
+                    # Layout data
+                    dict(shapes=[
+                        # horizontal line
+                        dict(
+                            type="line",
+                            x0=0,
+                            x1=1,
+                            y0=y,
+                            y1=y,
+                            xref="paper",
+                            yref="y",
+                            line=dict(dash="dot"),
+                        ),
+
+                        # vertical line
+                        dict(
+                            type="line",
+                            x0=x,
+                            x1=x,
+                            y0=0,
+                            y1=1,
+                            xref="x",
+                            yref="paper",
+                            line=dict(dash="dot"),
+                        )],
+
+                        annotations=[
+                            # horizontal line
+                            dict(
+                                x=1,
+                                y=y,
+                                xref='paper',
+                                yref='y',
+                                text=f'mtf = {y:.2f}',
+                                showarrow=False,
+                                xanchor='right',
+                                yanchor='bottom',
+                            ),
+
+                            # vertical line
+                            dict(
+                                x=x,
+                                y=0,
+                                xref='x',
+                                yref='paper',
+                                text=f'𝛎 = {x:.2f}',
+                                textangle=-90,
+                                showarrow=False,
+                                xanchor='right',
+                                yanchor='bottom',
+                            ),
+                        ],
+                    ),
+                ]
+            )
+            steps.append(step)
+
+        # Create slider data
+        sliders = [dict(
+            active=4,  # start with first step selected
+            currentvalue=dict(prefix='𝛎 shown for MTF = '),
+            pad={"t": 50},
+            steps=steps
+        )]
+
+        fig.update_layout(
+            sliders=sliders,
+            title='<b>Modulation Transfer Function (MTF) Measurement</b>',
+            xaxis_title='Frequency, 𝛎 (lp/mm)',
+            yaxis_title='MTF',
+            showlegend=False,
         )
 
         return fig
@@ -666,7 +1028,11 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             max_contrast = np.max([roi.contrast for roi in self.low_contrast_rois])
 
             # define color normalization (borrow from matplotlib)
-            norm = mpl.colors.TwoSlopeNorm(vmin=0, vmax=float(max_contrast), vcenter=float(self._low_contrast_threshold))
+            norm = mpl.colors.TwoSlopeNorm(
+                vmin=0,
+                vmax=float(max_contrast),
+                vcenter=float(self._low_contrast_threshold),
+            )
 
             # add to graph
             roi: ecu.pylinac_utils.roi.LowContrastDiscROI
@@ -691,7 +1057,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             self.high_contrast_max_roi.add_to_interactive_plot(
                 fig=fig,
                 line_color='rgb(255, 255, 0)',
-                fill_color='rgba(0, 0, 0, 0.0)', # fill with transparent color to trigger hover text inside outline
+                fill_color='rgba(0, 0, 0, 0.0)',  # fill with transparent color to trigger hover text inside outline
                 show_arrow=False,
                 show_legend=True,
                 legend_text='Max',
@@ -725,12 +1091,20 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             #         legend_group_rank=hc_rank,
             #     )
 
+            # define color normalization (borrow from matplotlib)
+            norm = mpl.colors.TwoSlopeNorm(
+                vmin=0,
+                vmax=1,
+                vcenter=float(self._high_contrast_threshold),
+            )
+
             rect_roi: ecu.pylinac_utils.roi.HighContrastRectangularROI
             for index, rect_roi in enumerate(self.high_contrast_rectangular_rois):
                 rect_roi.add_to_interactive_plot(
                     fig=fig,
-                    fill_color='rgba(255, 255, 0, 0.2)',
-                    hover_text=f'{rect_roi.nominal_line_pairs_per_mm} lp/mm',
+                    fill_color=px.colors.sample_colorscale(px.colors.diverging.RdYlGn, norm(rect_roi.mtf))[0],
+                    opacity=0.4,
+                    hover_text=f'{rect_roi.nominal_line_pairs_per_mm} lp/mm, MTF = {rect_roi.mtf:.2}',
                     show_arrow=False,
                     show_legend=True if index == 0 else False,
                     legend_text=f'ROIs',
