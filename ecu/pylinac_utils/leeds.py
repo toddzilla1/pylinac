@@ -58,6 +58,9 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
     # Overriding base high contrast methods
     high_contrast_roi_settings = None
 
+    # Default x-axis range for FFT graphs. Should cover expected range of high contrast nominal line pairs per mm.
+    DEFAULT_LP_PER_MM_GRAPH_RANGE: typing.ClassVar = [0, 6]
+
     high_contrast_roi_strips = [
         ecu.pylinac_utils.roi.HighContrastRectangularROIStrip.define_relative_to_phantom(
             location_radius_rel_phantom=0.234,
@@ -87,19 +90,28 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
     high_contrast_roi_strips[0].all_nominal_line_pairs_per_region = [5, 5, 5, 5, 5, 5, 5]
     high_contrast_roi_strips[0].region_fractional_divisions = [-0.027962, 0.294, 0.52885, 0.6983, 0.81776, 0.90176,
                                                                0.96164, 1.0038]
+    high_contrast_roi_strips[0].max_lp_per_mm_for_fft = DEFAULT_LP_PER_MM_GRAPH_RANGE[1]
 
     high_contrast_roi_strips[1].all_nominal_line_pairs_per_mm = [0.56, 0.8, 1.12, 1.6, 2.24, 3.15, 4.5]
     high_contrast_roi_strips[1].all_nominal_line_pairs_per_region = [5, 5, 5, 5, 5, 5, 5]
     high_contrast_roi_strips[1].region_fractional_divisions = [-0.02553, 0.28228, 0.52156, 0.69467, 0.81519, 0.90145,
                                                                0.9623, 1.009]
+    high_contrast_roi_strips[1].max_lp_per_mm_for_fft = DEFAULT_LP_PER_MM_GRAPH_RANGE[1]
 
     high_contrast_roi_strips[2].all_nominal_line_pairs_per_mm = [0.63, 0.9, 1.25, 1.8, 2.5, 3.55, 5.0]
     high_contrast_roi_strips[2].all_nominal_line_pairs_per_region = [5, 5, 5, 5, 5, 5, 5]
     high_contrast_roi_strips[2].region_fractional_divisions = [-0.039873, 0.27358, 0.51645, 0.69112, 0.81195, 0.89989,
                                                                0.9618, 1.01]
+    high_contrast_roi_strips[2].max_lp_per_mm_for_fft = DEFAULT_LP_PER_MM_GRAPH_RANGE[1]
 
-    # Default x-axis range for FFT graphs. Should cover expected range of high contrast nominal line pairs per mm.
-    DEFAULT_LP_PER_MM_GRAPH_RANGE: typing.ClassVar = [0, 6]
+    # Expected distance, in mm, between low contrast regions 0 and 9
+    NOMINAL_PHANTOM_REF_DIAMETER_MM = 120.0
+
+    geometric_correction_ratio_nominal_vs_measured: pydantic.PositiveFloat = pydantic.Field(
+        default=1.0,
+        description='Phantom might not be placed at imaging isocenter. This will cause the DICOM reported pixel size '
+                    'to be incorrect. Use this ratio to correct if needed.',
+    )
 
     # Default MTF spline smoothing factor
     DEFAULT_MTF_SPLINE_SMOOTHING_FACTOR = 1e-4
@@ -152,13 +164,13 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
         self.high_res_center = high_res_center
 
         # place min / max regions on image
-        pixel_size_mm = 1.0 / self.image.dpmm
+        corrected_pixel_size_mm = (1.0 / self.image.dpmm) * self.geometric_correction_ratio_nominal_vs_measured
         self.high_contrast_min_roi.place_roi_on_image(
             image_array=self.image.array,
             phantom_center_px=self.high_res_center,
             phantom_angle_deg_rel_image=self.phantom_angle,
             phantom_radius_px=self.phantom_radius,
-            pixel_size_mm=pixel_size_mm,
+            pixel_size_mm=corrected_pixel_size_mm,
         )
 
         self.high_contrast_max_roi.place_roi_on_image(
@@ -166,7 +178,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             phantom_center_px=self.high_res_center,
             phantom_angle_deg_rel_image=self.phantom_angle,
             phantom_radius_px=self.phantom_radius,
-            pixel_size_mm=pixel_size_mm,
+            pixel_size_mm=corrected_pixel_size_mm,
         )
 
         # OVERRIDDEN to use custom high contrast ROIs strips
@@ -180,7 +192,7 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
                 phantom_center_px=self.high_res_center,
                 phantom_angle_deg_rel_image=self.phantom_angle,
                 phantom_radius_px=self.phantom_radius,
-                pixel_size_mm=pixel_size_mm,
+                pixel_size_mm=corrected_pixel_size_mm,
             )
 
             for roi in strip.regions:
@@ -241,6 +253,9 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
         # Custom low contrast ROI processing
         self.low_contrast_background_rois, self.low_contrast_rois = self._sample_low_contrast_rois()
 
+        # Check phantom reference diameter
+        self._check_phantom_reference_diameter()
+
         # Custom high contrast ROIs
         self.high_contrast_rectangular_rois = self._sample_high_contrast_rois()
 
@@ -261,6 +276,19 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
                         f'MTF calculation and results can vary from image to image. In this image the phantom angle '
                         f'is {phantom_angle_deg:.1f}°, which is within 3° of a cardinal angle or diagonal. Consider '
                         f're-imaging at a different angle.',
+            )
+
+    def _check_phantom_reference_diameter(self):
+        """Use the distance between low contrast regions 0 and 9 as a reference diameter."""
+        measured_ref_diameter_mm = self.low_contrast_rois[0].center.distance_to(
+            self.low_contrast_rois[9].center) / self.image.dpmm
+        self.geometric_correction_ratio_nominal_vs_measured = (self.NOMINAL_PHANTOM_REF_DIAMETER_MM /
+                                                               measured_ref_diameter_mm)
+        if abs(1.0 - self.geometric_correction_ratio_nominal_vs_measured) > 0.005:
+            warnings.warn(
+                f'Measured reference diameter ({measured_ref_diameter_mm:.2f} mm) differs by more than 0.5% from the '
+                f'expected value ({self.NOMINAL_PHANTOM_REF_DIAMETER_MM} mm). This can happen when the phantom is '
+                f'not at isocenter during imaging. Measurements will be scaled accordingly.'
             )
 
     # Override to use annulus ROIs
@@ -644,6 +672,23 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             annotation_position='top right',
         )
 
+        # Add a vertical line at the measured frequency
+        measured_color = 'rgba(255, 0, 0, 0.4)'
+        x0 = self.high_contrast_rectangular_rois[0].measured_line_pairs_per_mm
+        fig.add_vline(
+            x=x0,
+            line_color=measured_color,
+            line_dash='dash',
+        )
+
+        # Add a horizontal line at the measured magnitude
+        y0 = self.high_contrast_rectangular_rois[0].ideal_fft_max_magnitude * self.high_contrast_rectangular_rois[0].mtf
+        fig.add_hline(
+            y=y0,
+            line_color=measured_color,
+            line_dash='dash',
+        )
+
         # Plot title
         def title_str(j):
             return (f'<b>High Contrast FFT Data</b><br>'
@@ -656,8 +701,11 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
         for i in range(len(fig.data) // 2):
             is_visible_list = [False] * len(fig.data)
             is_visible_list[2 * i:2 * i + 2] = (True, True)
-            x = self.high_contrast_rectangular_rois[i].nominal_line_pairs_per_mm
-            y = self.high_contrast_rectangular_rois[i].ideal_fft_max_magnitude
+            x_ideal = self.high_contrast_rectangular_rois[i].nominal_line_pairs_per_mm
+            y_ideal = self.high_contrast_rectangular_rois[i].ideal_fft_max_magnitude
+            x_measured = self.high_contrast_rectangular_rois[i].measured_line_pairs_per_mm
+            y_measured = (self.high_contrast_rectangular_rois[i].ideal_fft_max_magnitude *
+                          self.high_contrast_rectangular_rois[i].mtf)
             step = dict(
                 label=f'{i + 1}',
                 method='update',
@@ -668,11 +716,11 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
                     # Layout data
                     dict(title=title_str(i),
                          shapes=[
-                             # vertical line
+                             # ideal vertical line
                              dict(
                                  type="line",
-                                 x0=x,
-                                 x1=x,
+                                 x0=x_ideal,
+                                 x1=x_ideal,
                                  y0=0,
                                  y1=1,
                                  xref="x",
@@ -680,39 +728,63 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
                                  line=dict(dash="dot"),
                              ),
 
-                             # horizontal line
+                             # ideal horizontal line
                              dict(
                                  type="line",
                                  x0=0,
                                  x1=1,
-                                 y0=y,
-                                 y1=y,
+                                 y0=y_ideal,
+                                 y1=y_ideal,
                                  xref="paper",
                                  yref="y",
                                  line=dict(dash="dot"),
+                             ),
+
+                             # measured vertical line
+                             dict(
+                                 type="line",
+                                 x0=x_measured,
+                                 x1=x_measured,
+                                 y0=0,
+                                 y1=1,
+                                 xref="x",
+                                 yref="paper",
+                                 line=dict(dash="dash", color=measured_color),
+                             ),
+
+                             # measured horizontal line
+                             dict(
+                                 type="line",
+                                 x0=0,
+                                 x1=1,
+                                 y0=y_measured,
+                                 y1=y_measured,
+                                 xref="paper",
+                                 yref="y",
+                                 line=dict(dash="dash", color=measured_color),
                              )
                          ],
                          annotations=[
-                             # vertical line
+                             # ideal vertical line
                              dict(
-                                 x=x,
+                                 x=x_ideal,
                                  y=0,
                                  xref='x',
                                  yref='paper',
-                                 text=f' nominal 𝛎 = {x:.2f}',
+                                 text=f' nominal 𝛎 = {x_ideal:.2f}',
                                  textangle=-90,
                                  showarrow=False,
                                  xanchor='right',
                                  yanchor='bottom',
                              ),
 
-                             # horizontal line
+                             # ideal horizontal line
                              dict(
                                  x=1,
-                                 y=y,
+                                 y=y_ideal,
                                  xref='paper',
                                  yref='y',
-                                 text=f'ideal signal max = {y:.2f}',
+                                 text=f'ideal signal max = {y_ideal:.2f}',
                                  showarrow=False,
                                  xanchor='right',
                                  yanchor='bottom',

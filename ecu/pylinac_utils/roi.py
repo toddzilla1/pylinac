@@ -318,6 +318,11 @@ class RectangularROI(pydantic.BaseModel):
         description='Pixel size in mm. Assumes square pixels.'
     )
 
+    max_lp_per_mm_for_fft: typing.Optional[float] = pydantic.Field(
+        default=None,
+        description='Used to limit FFT analysis to less than the given value.'
+    )
+
     # Constants for labeling Pandas columns; used in both HighContrastRectangularROI and HighContrastRectangularROIStrip
     # so placed here to be visible to both.
     COL_PIXEL_VALUE: typing.ClassVar[str] = 'Pixel Value'
@@ -682,6 +687,7 @@ class HighContrastRectangularROI(RectangularROI):
                         profile_raw: pd.DataFrame,
                         profile_resampled: pd.DataFrame,
                         resampling_interval_mm: float,
+                        max_lp_per_mm_for_fft: float,
                         ) -> 'HighContrastRectangularROI':
         return HighContrastRectangularROI(
             nominal_line_pairs=nominal_line_pairs,
@@ -697,6 +703,7 @@ class HighContrastRectangularROI(RectangularROI):
             profile_resampled=profile_resampled,
             profile_raw=profile_raw,
             resampling_interval_mm=resampling_interval_mm,
+            max_lp_per_mm_for_fft=max_lp_per_mm_for_fft,
         )
 
     @classmethod
@@ -872,7 +879,10 @@ class HighContrastRectangularROI(RectangularROI):
         # Save interpolated data in dataframe
         start_per_mm = math.ceil(self.fft_data[self.COL_FFT_FREQS].min() * 100) / 100  # round to 0.01
         end_per_mm = math.ceil(self.fft_data[self.COL_FFT_FREQS].max() * 100) / 100  # round to 0.01
-        xs = np.arange(start_per_mm, end_per_mm, 0.01)
+        if self.max_lp_per_mm_for_fft is not None:
+            if end_per_mm > self.max_lp_per_mm_for_fft:
+                end_per_mm = self.max_lp_per_mm_for_fft
+        xs = np.arange(start_per_mm, end_per_mm + 0.01, 0.01)
         ys = spline(xs)
         self.fft_data_interpolated = pd.DataFrame({
             self.COL_FFT_FREQS: xs,
@@ -1044,6 +1054,11 @@ class HighContrastRectangularROIStrip(RectangularROI):
                     'pixel in mm divided by this number.'
     )
 
+    max_lp_per_mm_for_fft: typing.Optional[float] = pydantic.Field(
+        default=None,
+        description='Used to limit FFT analysis to less than the given value.'
+    )
+
     @classmethod
     def define_relative_to_phantom(
             cls,
@@ -1172,6 +1187,7 @@ class HighContrastRectangularROIStrip(RectangularROI):
                     height_px=(end_mm - start_mm) / self.pixel_size_mm,
                     center_pt_px=center_pt_px,
                     rotation_rad_rel_image=self.rotation_rad_rel_image,
+                    max_lp_per_mm_for_fft=self.max_lp_per_mm_for_fft,
                 )
             )
 
