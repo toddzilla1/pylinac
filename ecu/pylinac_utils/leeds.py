@@ -996,25 +996,98 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
 
         return fig
 
-    @pydantic.validate_arguments
-    def plot_interactive_phantom_image(self, colors: list = px.colors.sequential.gray,
-                                       color_cycles: pydantic.PositiveInt = 1,
-                                       image_only: bool = False) -> go.Figure:
+    def plot_interactive_phantom_image(self, image_only: bool = False) -> go.Figure:
         """ Create interactive figure of the Leeds TOR phantom and analysis. """
 
         #
         # Background image
         #
 
-        fig = px.imshow(
-            img=self.image.array,
-            color_continuous_scale=colors * color_cycles,
-            height=self.image.array.shape[0],
-            width=self.image.array.shape[1],
-        )
+        # Color scales for this image
+        color_scales = {
+            "Gray": px.colors.sequential.gray,
+            "Color": px.colors.cyclical.IceFire,
+        }
 
-        # No colorbar
-        fig.update_layout(coloraxis_showscale=False)
+        # Updates color scale with repeated colors; returns in format used internally by Plotly
+        def get_colorscale(list_of_colors, num_cycles):
+            n_colors = len(list_of_colors) * num_cycles
+            x_values = np.linspace(start=0, stop=1, num=n_colors)
+            x_values = [float(x) for x in x_values]
+            extended_colors = list_of_colors * num_cycles
+            return [[x_values[num], extended_colors[num]] for num in range(n_colors)]
+
+        # Create slider steps based on the selected color scale
+        def update_slider_steps(selected_colorscale):
+            steps = []
+            for i in range(1, 11):
+                step = dict(
+                    method="restyle",
+                    args=[{"colorscale": [get_colorscale(list_of_colors=selected_colorscale, num_cycles=i)]}],
+                    label=str(i),
+                )
+                steps.append(step)
+            return steps
+
+        # Initial color scale and figure
+        initial_colorscale = color_scales["Gray"]
+        fig = go.Figure(data=go.Heatmap(
+            z=self.image.array,
+            colorscale=get_colorscale(list_of_colors=initial_colorscale, num_cycles=1),
+            showscale=True,  # Show color bar?
+            # colorbar=dict(
+            #     orientation="v",
+            #     # title="Color",
+            #     # x=1.0,
+            #     # y=0.5,
+            #     # xanchor="left",
+            #     # yanchor="middle",
+            #     # xref="paper",
+            #     # yref="paper",
+            # ),
+        ))
+
+        # Initial slider with steps
+        sliders = [dict(
+            active=0,
+            currentvalue={"prefix": "Color Cycles: "},
+            steps=update_slider_steps(initial_colorscale),
+        )]
+
+        # Create buttons for different color scales
+        buttons = []
+        for scale_name, scale_colors in color_scales.items():
+            buttons.append(
+                dict(
+                    method="update",
+                    args=[
+                        {"colorscale": [get_colorscale(list_of_colors=scale_colors, num_cycles=1)]},
+                        {"sliders": [dict(
+                            active=0,
+                            currentvalue={"prefix": "Color Cycles: "},
+                            steps=update_slider_steps(scale_colors),
+                        )]}
+                    ],
+                    label=scale_name,
+                )
+            )
+
+        # Add buttons and slider to the layout
+        fig.update_layout(
+            sliders=sliders,
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="down",
+                    buttons=buttons,
+                    showactive=True,
+                    # x=1.0,
+                    # xanchor="center",
+                    # y=-0.1,
+                    # yanchor="top",
+                )
+            ]
+        )
 
         # Phantom outline
         if not image_only:
@@ -1191,14 +1264,35 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
         # update group click action
         fig.update_layout(legend=dict(groupclick="togglegroup"))
 
+        # Styling
+        fig.update_layout(
+            xaxis=dict(
+                showticklabels=False,
+                showgrid=False,
+                zeroline=False,
+                scaleanchor="y",
+                constrain="domain",
+            ),
+            yaxis=dict(
+                showticklabels=False,
+                showgrid=False,
+                zeroline=False,
+                constrain="domain"
+            ),
+            margin=dict(l=20, r=20, b=20),
+            width=self.image.array.shape[1],
+            height=self.image.array.shape[0],
+            # title=f'{leeds.image.date_created()}'
+        )
+
         # configure plot options
-        config = {
-            # 'scrollZoom': True,
-            'displaylogo': False,
-            # 'responsive': True,
-            'toImageButtonOptions': {
-                'filename': 'leeds_analysis'
-            }
-        }
+        # config = {
+        #     # 'scrollZoom': True,
+        #     'displaylogo': False,
+        #     # 'responsive': True,
+        #     'toImageButtonOptions': {
+        #         'filename': 'leeds_analysis'
+        #     }
+        # }
 
         return fig
