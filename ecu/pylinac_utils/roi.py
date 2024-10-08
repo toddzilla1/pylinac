@@ -56,7 +56,7 @@ class LowContrastDiscROI(pylinac.core.roi.LowContrastDiskROI):
             legendgroup=legend_group,
             legendgrouptitle={'text': legend_group_title},
             legendrank=legend_group_rank,
-            text=f'{self.contrast:.3f}',
+            text=f'Contrast = {self.contrast:.3f}',
             name=legend_text,
         ))
 

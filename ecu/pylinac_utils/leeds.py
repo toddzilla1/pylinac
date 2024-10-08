@@ -1035,16 +1035,10 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
             z=self.image.array,
             colorscale=get_colorscale(list_of_colors=initial_colorscale, num_cycles=1),
             showscale=True,  # Show color bar?
-            # colorbar=dict(
-            #     orientation="v",
-            #     # title="Color",
-            #     # x=1.0,
-            #     # y=0.5,
-            #     # xanchor="left",
-            #     # yanchor="middle",
-            #     # xref="paper",
-            #     # yref="paper",
-            # ),
+            colorbar=dict(
+                orientation="v",
+                showticklabels=False,
+            ),
         ))
 
         # Initial slider with steps
@@ -1081,10 +1075,6 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
                     direction="down",
                     buttons=buttons,
                     showactive=True,
-                    # x=1.0,
-                    # xanchor="center",
-                    # y=-0.1,
-                    # yanchor="top",
                 )
             ]
         )
@@ -1261,8 +1251,12 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
                     legend_group_rank=hc_rank,
                 )
 
-        # update group click action
-        fig.update_layout(legend=dict(groupclick="togglegroup"))
+        # update legend properties
+        fig.update_layout(legend=dict(
+            groupclick="togglegroup",
+            xanchor="left",
+            x=1.11,
+        ))
 
         # Styling
         fig.update_layout(
@@ -1280,9 +1274,9 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
                 constrain="domain"
             ),
             margin=dict(l=20, r=20, b=20),
-            width=self.image.array.shape[1],
+            width=self.image.array.shape[1] * 1.08,
             height=self.image.array.shape[0],
-            # title=f'{leeds.image.date_created()}'
+            title=f'<b>{self.image.date_created()}</b>'
         )
 
         # configure plot options
