@@ -4,19 +4,18 @@ import random
 import typing
 import warnings
 
-import plotly.express as px
-import plotly.graph_objects as go
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
 import py_linq
 import pydantic
 import scipy.interpolate
 
+import ecu.pylinac_utils.roi
 import pylinac
 import pylinac.core.roi
-
-import ecu.pylinac_utils.roi
 
 
 class LeedsTORUpdated(pylinac.LeedsTOR):
