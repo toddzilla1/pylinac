@@ -1216,18 +1216,18 @@ class LeedsTORUpdated(pylinac.LeedsTOR):
                 legend_group_rank=hc_rank,
             )
 
-            # strip: ecu.pylinac_utils.roi.HighContrastRectangularROIStrip
-            # for i, strip in enumerate(self.high_contrast_roi_strips, start=1):
-            #     strip.add_to_interactive_plot(
-            #         fig=fig,
-            #         line_color='rgba(0, 0, 255, 0.4)',
-            #         show_arrow=True,
-            #         show_legend=True,
-            #         legend_text=f'Strip {i}',
-            #         legend_group='hc_rois',
-            #         legend_group_title='High Contrast',
-            #         legend_group_rank=hc_rank,
-            #     )
+            strip: ecu.pylinac_utils.roi.HighContrastRectangularROIStrip
+            for i, strip in enumerate(self.high_contrast_roi_strips, start=1):
+                strip.add_to_interactive_plot(
+                    fig=fig,
+                    line_color='rgba(0, 0, 255, 0.4)',
+                    show_arrow=True,
+                    show_legend=True,
+                    legend_text=f'Strip {i}',
+                    legend_group='hc_rois',
+                    legend_group_title='High Contrast',
+                    legend_group_rank=hc_rank,
+                )
 
             # define color normalization (borrow from matplotlib)
             norm = mpl.colors.TwoSlopeNorm(
