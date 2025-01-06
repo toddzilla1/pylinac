@@ -1044,7 +1044,7 @@ class HighContrastRectangularROIStrip(RectangularROI):
     )
 
     regions: typing.List[HighContrastRectangularROI] = pydantic.Field(
-        default=[],
+        default_factory=list,
         description='The list of high contrast rectangular ROI derived from this strip.'
     )
 
